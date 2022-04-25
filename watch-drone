@@ -1,0 +1,111 @@
+#!/bin/bash
+
+set -e
+
+case "$1" in
+    ''|'-h'|'-help'|'--help')
+        echo "Usage: $0 repo [build]"
+        echo "Watches all logs from a build of repo"
+        echo "Arguments:"
+        echo "  repo: repository in group/project format."
+        echo "  build (optional): build number to monitor, defaults to latest running build"
+	    exit 1
+        ;;
+esac
+
+REPO="$1"
+
+if [ -n "$2" ]; then
+    BUILD_NUM="$2"
+else
+    echo "Finding latest running build..."
+    BUILD_NUM=$(drone build ls --status running --format '{{.Number}}' "$REPO" | head -n 1)
+    if [ -z "$BUILD_NUM" ]; then
+        echo "No running builds found for $REPO"
+        exit 1
+    fi
+    echo "Found build $BUILD_NUM"
+fi
+
+set -u
+
+# Create temp file for storing logs, and delete on exit.
+TEMP_LOG_FILE=$(mktemp)
+function cleanup {
+    rm -f "$TEMP_LOG_FILE"
+}
+trap cleanup EXIT
+
+# Function to get current info of all steps in pipeline.
+# Prints a line for each step with the following tab-separated columns:
+# Stage number, stage name, step number, step name, step status.
+# If parsing the output, it should be split on tab character only, as stage/
+# step names can contain spaces.
+function get_all_step_info {
+    INFO_FMT='
+        {{- range .Stages}}
+            {{- with $stage:=.}}
+                {{- range .Steps}}
+                    {{- $stage.Number}}{{"\t"}}
+                    {{- $stage.Name}}{{"\t"}}
+                    {{- .Number}}{{"\t"}}
+                    {{- .Name}}{{"\t"}}
+                    {{- .Status}}{{"\n"}}
+                {{- end}}
+            {{- end}}
+        {{- end -}}
+    '
+    drone build info --format "$INFO_FMT" "$REPO" "$BUILD_NUM"
+}
+
+# Function to print the current status of a step. Takes two paramaters; the
+# stage number and the step number.
+function get_step_status {
+    get_all_step_info | awk -F $'\t' -v "stage=$1" -v "step=$2" \
+                            '$1==stage && $3==step {print $5; exit}'
+}
+
+# Get the last running step as a starting point. This is so we don't get hung 
+# up polling logs for services, which run throughout the pipeline.
+read -r LAST_RUNNING_STAGE LAST_RUNNING_STEP < <(
+    get_all_step_info | awk -F $'\t' '$5=="running" {stage=$1; step=$3} END {print stage, step}'
+)
+
+# Loop through steps, starting at the last running step, printing the logs as 
+# we go. If we get to a step which hasn't finished yet, stream the logs.
+echo 'Tailing logs...'
+while IFS=$'\t' read -r STAGE_NUM STAGE_NAME STEP_NUM STEP_NAME STATUS; do
+    echo "========================="
+    echo "$STAGE_NAME - $STEP_NAME"
+    echo "========================="
+
+    while [ "$STATUS" = pending ]; do
+        echo 'Waiting for step to start...'
+        sleep 2
+        STATUS=$(get_step_status "$STAGE_NUM" "$STEP_NUM")
+    done
+    echo
+
+    # Try and get the logs using CLI; if fails, then stream them with stream 
+    # API. `drone log view` prints prints both logs to stdout as well as errors.
+    # So store in temp file, and if it succeeded, dump it to stdout.
+    if drone log view "$REPO" "$BUILD_NUM" "$STAGE_NUM" "$STEP_NUM" &>"$TEMP_LOG_FILE"; then
+        cat "$TEMP_LOG_FILE"
+    else
+        # 1. Submit curl request stream API to stream the logs in SSE format.
+        # 2. Use sed to only print data: lines with a json object, and strip prefix.
+        # 3. Use jq to print .out attribute, which is the actual log line.
+        curl -sN -H "Authorization: Bearer $DRONE_TOKEN" \
+            "$DRONE_SERVER/api/stream/$REPO/$BUILD_NUM/$STAGE_NUM/$STEP_NUM" | \
+            sed -nl '/^data: {/ s/^data: // p' | jq -j '.out'
+    fi
+    echo
+    echo "== Step status: $(get_step_status "$STAGE_NUM" "$STEP_NUM") =="
+    echo
+
+done < <(             # Use awk to start printing from last running step.
+    get_all_step_info | awk -F $'\t' \
+                          -v "lr_stage=$LAST_RUNNING_STAGE" \
+                          -v "lr_step=$LAST_RUNNING_STEP" \
+                          '$1==lr_stage && $3==lr_step {found=1} found==1 {print}'
+)
